@@ -35,29 +35,57 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+
+    completed = {p.stem for p in output_root.glob("*.json") if p.is_file()}
+    if not completed:
+        trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    remaining_ids = [cid for cid in case_set.case_ids if cid not in completed]
+    if not remaining_ids:
+        print(f"All {len(case_set.case_ids)} cases are already completed.")
+        return
+
+    idx = 0
+    max_retries = 10
+    retries = 0
+    while idx < len(remaining_ids):
+        case_id = remaining_ids[idx]
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while idx < len(remaining_ids):
+                    case_id = remaining_ids[idx]
+                    case = case_set.cases[case_id]
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    target = output_root / f"{case_id}.json"
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    print(f"[{len(completed) + idx + 1}/{len(case_set.case_ids)}] Done {case_id}")
+                    idx += 1
+                    retries = 0
+        except Exception as exc:
+            retries += 1
+            if retries > max_retries:
+                raise
+            print(
+                f"Connection dropped at {case_id} ({exc}), reconnecting in 3s... "
+                f"(attempt {retries}/{max_retries})",
+                file=sys.stderr,
             )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            await asyncio.sleep(3.0)
 
 
 def parser() -> argparse.ArgumentParser:
