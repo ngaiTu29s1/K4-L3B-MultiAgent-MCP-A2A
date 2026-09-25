@@ -11,7 +11,7 @@ from . import OUTPUT_SCHEMA_VERSION, VARIANT_ID
 from .cases import CaseSet
 from .contracts import Contracts
 
-SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
+SECRET_PATTERN = re.compile(r"(?:sk-team-|gsk_)[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
 
