@@ -16,7 +16,6 @@ class Settings:
     team_api_key: str
     mcp_endpoint: str
     root: Path
-    gemini_api_key: str = ""
 
     @classmethod
     def load(cls, root: Path | None = None) -> Settings:
@@ -25,10 +24,6 @@ class Settings:
         api_url = os.getenv("COMPETITION_API_URL", "").strip().rstrip("/")
         team_key = os.getenv("COMPETITION_TEAM_API_KEY", "").strip()
         mcp_endpoint = os.getenv("MCP_ENDPOINT", "").strip()
-        gemini_api_key = (
-            os.getenv("GEMINI_API_KEY", "").strip()
-            or os.getenv("GOOGLE_API_KEY", "").strip()
-        )
         errors: list[str] = []
         if not api_url.startswith(("http://", "https://")):
             errors.append("COMPETITION_API_URL must be an absolute HTTP(S) URL")
@@ -38,4 +33,4 @@ class Settings:
             errors.append("MCP_ENDPOINT must be an absolute HTTP(S) URL")
         if errors:
             raise ValueError("; ".join(errors))
-        return cls(api_url, team_key, mcp_endpoint, resolved_root, gemini_api_key)
+        return cls(api_url, team_key, mcp_endpoint, resolved_root)

@@ -16,23 +16,34 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._catalog: list[dict[str, Any]] | None = None
+
+    async def describe_tools(self) -> list[dict[str, Any]]:
+        """Discover tool names and argument schemas once per MCP session."""
+        if self._catalog is None:
+            response = await self._session.list_tools()
+            self._catalog = [
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "input_schema": tool.input_schema or {},
+                }
+                for tool in response.tools
+            ]
+        return self._catalog
 
     async def list_tools(self) -> list[str]:
-        response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        return sorted(tool["name"] for tool in await self.describe_tools())
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        is_error = getattr(result, "is_error", getattr(result, "isError", False))
-        if is_error:
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
             raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
-        if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+        evidence = result.structured_content
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
