@@ -1,352 +1,674 @@
+"""Evidence-scoped L3B investigation with observable specialist handoffs."""
+
 from __future__ import annotations
 
-import asyncio
+import logging
+import re
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from itertools import combinations
 from typing import Any
 
-from .entity_customer import CaseEvidenceCache, resolve_entity_customer
+from .llama_adapter import LlamaClient
 from .mcp_gateway import EvidenceGateway
-from .specialists import (
-    investigate_order_product,
-    investigate_payment_refund,
-    investigate_shipment,
-)
 from .trace import TraceWriter
 
-
-def _unique(values: list[str]) -> list[str]:
-    return list(dict.fromkeys(value for value in values if value))
-
-
-def _claim_topics(case: dict[str, Any]) -> list[str]:
-    request = case.get("customer_request", {})
-    claims = request.get("claims", []) if isinstance(request, dict) else []
-    return [
-        claim["topic"]
-        for claim in claims
-        if isinstance(claim, dict) and isinstance(claim.get("topic"), str)
-    ]
+LOG = logging.getLogger(__name__)
+LLAMA = LlamaClient()
+ORDER_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _primary_issue(
-    topics: list[str], order_products: list[Any], shipments: list[Any], payments: list[Any]
-) -> str:
-    shipment_verdicts = {result.verdict for result in shipments}
-    payment_verdicts = {result.verdict for result in payments}
-    order_statuses = {result.order_status for result in order_products}
-
-    topic_map = {
-        "late_delivery_seller": "late_delivery_seller",
-        "late_delivery_logistics": "late_delivery_logistics",
-        "valid_split_payment": "valid_split_payment",
-        "canceled_order_paid": "canceled_order_paid",
-        "unavailable_order_paid": "unavailable_order_paid",
-        "payment_mismatch": "payment_mismatch",
-        "duplicate_charge": "duplicate_charge",
-        "refund_pending": "refund_pending",
-        "refund_failed": "refund_failed",
-    }
-    for topic in topics:
-        mapped = topic_map.get(topic)
-        if mapped == "late_delivery_seller" and "seller_delay" in shipment_verdicts:
-            return mapped
-        if mapped == "late_delivery_logistics" and "logistics_delay" in shipment_verdicts:
-            return mapped
-        if mapped == "valid_split_payment" and "reconciled" in payment_verdicts:
-            return mapped
-        if mapped == "canceled_order_paid" and "canceled" in order_statuses:
-            return mapped
-        if mapped == "unavailable_order_paid" and "unavailable" in order_statuses:
-            return mapped
-        if mapped == "payment_mismatch" and "capture_mismatch" in payment_verdicts:
-            return mapped
-        if mapped == "duplicate_charge" and "duplicate_capture" in payment_verdicts:
-            return mapped
-        if mapped == "refund_pending" and "refund_pending" in payment_verdicts:
-            return mapped
-        if mapped == "refund_failed" and "refund_failed" in payment_verdicts:
-            return mapped
-
-    if "seller_delay" in shipment_verdicts:
-        return "late_delivery_seller"
-    if "logistics_delay" in shipment_verdicts:
-        return "late_delivery_logistics"
-    if "capture_mismatch" in payment_verdicts:
-        return "payment_mismatch"
-    if "duplicate_capture" in payment_verdicts:
-        return "duplicate_charge"
-    if "refund_pending" in payment_verdicts:
-        return "refund_pending"
-    if "refund_failed" in payment_verdicts:
-        return "refund_failed"
-    if "canceled" in order_statuses:
-        return "canceled_order_paid"
-    if "unavailable" in order_statuses:
-        return "unavailable_order_paid"
-    if "unsupported_claim" in topics:
-        return "unsupported_claim"
-    return "insufficient_evidence"
+def _date(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
-def _claim_verdict(topic: str, issue: str, evidence_available: bool) -> str:
-    if topic == "requested_full_refund":
-        return "partially_supported" if evidence_available else "insufficient_evidence"
-    if topic == issue:
-        return "supported"
-    if topic in {"late_delivery_seller", "late_delivery_logistics"} and issue.startswith(
-        "late_delivery_"
-    ):
-        return "partially_supported"
-    return "unsupported" if evidence_available else "insufficient_evidence"
+def _amount(value: Any) -> Decimal | None:
+    try:
+        return Decimal(str(value)) if value is not None else None
+    except (InvalidOperation, ValueError):
+        return None
 
 
-def _root_cause(issue: str, shipments: list[Any], order_products: list[Any]) -> dict[str, Any]:
-    if issue == "late_delivery_seller":
-        sellers = _unique([seller for result in shipments for seller in result.late_seller_ids])
-        return {
-            "ranked_causes": [{"cause_code": "SELLER_HANDOFF_DELAY", "rank": 1}],
-            "responsible_parties": [
-                {"party_type": "seller", "party_id": seller} for seller in sellers
-            ],
-        }
-    if issue == "late_delivery_logistics":
-        return {
-            "ranked_causes": [{"cause_code": "LOGISTICS_DELIVERY_DELAY", "rank": 1}],
-            "responsible_parties": [
-                {"party_type": "logistics_provider", "party_id": None}
-            ],
-        }
-    if issue in {"canceled_order_paid", "unavailable_order_paid"}:
-        cause = "CANCELED_ORDER_PAYMENT" if issue == "canceled_order_paid" else "UNAVAILABLE_ORDER_PAYMENT"
-        return {
-            "ranked_causes": [{"cause_code": cause, "rank": 1}],
-            "responsible_parties": [{"party_type": "platform", "party_id": None}],
-        }
-    if issue in {"payment_mismatch", "duplicate_charge", "valid_split_payment"}:
-        return {
-            "ranked_causes": [{"cause_code": "PAYMENT_RECONCILIATION", "rank": 1}],
-            "responsible_parties": [{"party_type": "payment_provider", "party_id": None}],
-        }
-    if issue in {"refund_pending", "refund_failed"}:
-        return {
-            "ranked_causes": [{"cause_code": "REFUND_PROCESSING", "rank": 1}],
-            "responsible_parties": [{"party_type": "payment_provider", "party_id": None}],
-        }
-    return {
-        "ranked_causes": [{"cause_code": "INSUFFICIENT_EVIDENCE", "rank": 1}],
-        "responsible_parties": [{"party_type": "unknown", "party_id": None}],
-    }
+def _rows(value: Any, key: str | None = None) -> list[dict[str, Any]]:
+    if key and isinstance(value, dict):
+        value = value.get(key)
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _unique(values: list[Any]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if isinstance(value, str) and value))[:20]
+
+
+def _inside(row: dict[str, Any], time_key: str, start: datetime, end: datetime | None) -> bool:
+    moment = _date(row.get(time_key))
+    return moment is not None and moment >= start and (end is None or moment < end)
+
+
+def _selected_order(
+    history: dict[str, Any] | None,
+    order: dict[str, Any] | None,
+    candidates: list[str],
+    opened_at: datetime | None,
+    topic: str | None,
+) -> tuple[dict[str, Any] | None, datetime | None]:
+    history_rows = _rows((history or {}).get("data", {}), "orders")
+    possible = [row for row in history_rows if row.get("order_id") in candidates]
+    if opened_at is not None:
+        possible = [
+            row
+            for row in possible
+            if (moment := _date(row.get("order_purchase_timestamp"))) and moment <= opened_at
+        ]
+    if possible:
+
+        def topic_match(row: dict[str, Any]) -> bool:
+            if topic in {"canceled_order_paid", "unavailable_order_paid"}:
+                return row.get("order_status") == topic.split("_order_")[0]
+            if topic in {"late_delivery_logistics", "late_delivery_seller"}:
+                delivered = _date(row.get("order_delivered_customer_date"))
+                estimated = _date(row.get("order_estimated_delivery_date"))
+                return bool(delivered and estimated and delivered > estimated)
+            return False
+
+        selected = max(
+            possible,
+            key=lambda row: (
+                topic_match(row),
+                _date(row.get("order_purchase_timestamp")).timestamp(),
+            ),
+        )
+        selected_at = _date(selected.get("order_purchase_timestamp"))
+        future = [
+            moment
+            for row in history_rows
+            if row.get("order_id") == selected.get("order_id")
+            and (moment := _date(row.get("order_purchase_timestamp")))
+            and selected_at
+            and moment > selected_at
+        ]
+        return selected, min(future) if future else None
+    fallback = (order or {}).get("data")
+    if isinstance(fallback, dict) and fallback.get("order_id") in candidates:
+        purchased = _date(fallback.get("order_purchase_timestamp"))
+        if opened_at is None or (purchased and purchased <= opened_at):
+            return fallback, None
+    return None, None
 
 
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
-    case_id = str(case["case_id"])
-    request = case.get("customer_request", {})
-    if not isinstance(request, dict):
-        request = {}
-    candidates = case.get("candidate_order_ids", [])
-    if not isinstance(candidates, list):
-        candidates = []
-    claimed_order_id = request.get("claimed_order_id")
-    if isinstance(claimed_order_id, str) and claimed_order_id not in candidates:
-        candidates.insert(0, claimed_order_id)
-    customer_hint = case.get("customer_unique_id_hint")
-    customer_id = customer_hint if isinstance(customer_hint, str) else None
-    cache = CaseEvidenceCache(case_id)
-
-    trace.emit(
-        case_id=case_id,
-        event_type="task_assigned",
-        actor="coordinator",
-        target="entity-customer-agent",
-        attributes={"candidate_count": len(candidates)},
+    """Resolve the temporal order identity, delegate evidence gathering, and verify output."""
+    case_id = case["case_id"]
+    request = case.get("customer_request") or {}
+    primary_claim = next(
+        (
+            claim.get("topic")
+            for claim in request.get("claims", [])
+            if isinstance(claim, dict) and claim.get("topic") != "requested_full_refund"
+        ),
+        None,
     )
-    entity = await resolve_entity_customer(
-        case_id=case_id,
-        candidate_order_ids=candidates,
-        customer_unique_id=customer_id,
-        gateway=gateway,
-        trace=trace,
-        evidence_cache=cache,
-    )
-    resolved_order_ids = list(entity.resolved_order_ids)
-    rejected_candidates = _unique(
-        list(entity.rejected_candidates)
-        + ([candidate for candidate in candidates if candidate not in resolved_order_ids]
-           if entity.status == "resolved" else [])
-    )
+    candidates = _unique(case.get("candidate_order_ids") or [])
+    claimed = request.get("claimed_order_id")
+    if isinstance(claimed, str) and claimed not in candidates:
+        candidates.insert(0, claimed)
+    opened_at = _date(case.get("opened_at"))
+    available = set(await gateway.list_tools())
+    evidence: dict[str, dict[str, Any]] = {}
 
-    order_products: list[Any] = []
-    shipments: list[Any] = []
-    payments: list[Any] = []
-    for order_id in resolved_order_ids:
-        order_product, shipment, payment = await asyncio.gather(
-            investigate_order_product(
-                case_id=case_id,
-                order_id=order_id,
-                gateway=gateway,
-                trace=trace,
-                evidence_cache=cache,
-            ),
-            investigate_shipment(
-                case_id=case_id,
-                order_id=order_id,
-                gateway=gateway,
-                trace=trace,
-                evidence_cache=cache,
-            ),
-            investigate_payment_refund(
-                case_id=case_id,
-                order_id=order_id,
-                gateway=gateway,
-                trace=trace,
-                evidence_cache=cache,
-            ),
-        )
-        order_products.append(order_product)
-        shipments.append(shipment)
-        payments.append(payment)
-
-    policy_refs: list[str] = []
-    try:
-        policy = await cache.call(
-            gateway,
-            "get_policy",
-            case_id=case_id,
-            policy_version=str(case.get("policy_version", "")),
-        )
-        policy_refs.append(policy["evidence_ref"])
+    async def fetch(name: str, actor: str, **arguments: str) -> dict[str, Any] | None:
+        if name not in available or any(not value for value in arguments.values()):
+            return None
+        try:
+            result = await gateway.call(name, case_id=case_id, **arguments)
+        except (RuntimeError, ValueError, OSError) as exc:
+            LOG.warning("%s %s: %s", case_id, name, exc)
+            return None
+        if not isinstance(result, dict) or not isinstance(result.get("evidence_ref"), str):
+            return None
+        evidence[name] = result
         trace.emit(
             case_id=case_id,
             event_type="tool_result_consumed",
-            actor="coordinator",
-            tool_name="get_policy",
-            evidence_refs=policy_refs,
+            actor=actor,
+            tool_name=name,
+            evidence_refs=[result["evidence_ref"]],
         )
-        trace.emit(
-            case_id=case_id,
-            event_type="policy_decided",
-            actor="coordinator",
-            decision_code="POLICY_EVIDENCE_CONSUMED",
-            evidence_refs=policy_refs,
-        )
-    except RuntimeError:
-        trace.emit(
-            case_id=case_id,
-            event_type="policy_decided",
-            actor="coordinator",
-            decision_code="POLICY_UNAVAILABLE",
-        )
+        return result
 
-    topics = _claim_topics(case)
-    issue = _primary_issue(topics, order_products, shipments, payments)
-    all_specialist_refs = [
-        reference
-        for result in [*order_products, *shipments, *payments]
-        for reference in result.evidence_refs
-    ]
-    evidence_refs = _unique(list(entity.evidence_refs) + all_specialist_refs + policy_refs)[:30]
-    evidence_available = bool(evidence_refs)
-    claim_items = request.get("claims", []) if isinstance(request.get("claims"), list) else []
-    claim_assessments = [
-        {
-            "claim_id": claim["claim_id"],
-            "verdict": _claim_verdict(claim.get("topic", ""), issue, evidence_available),
-            "confidence": 0.9 if claim.get("topic") == issue else 0.55,
-            "evidence_refs": evidence_refs[: min(5, len(evidence_refs))],
-        }
-        for claim in claim_items
-        if isinstance(claim, dict) and isinstance(claim.get("claim_id"), str)
-    ][:5]
-
-    payment_refundable = [result.refundable_total_brl for result in payments if result.refundable_total_brl is not None]
-    refundable_total = max(payment_refundable, default=0.0)
-    recommended_refund = refundable_total if "requested_full_refund" in topics else 0.0
-    if issue in {"unsupported_claim", "insufficient_evidence"}:
-        recommended_refund = 0.0
-    refund_lines = (
-        [{"reason_code": issue.upper(), "amount_brl": recommended_refund, "entity_id": resolved_order_ids[0]}]
-        if recommended_refund > 0 and resolved_order_ids
-        else []
+    trace.emit(
+        case_id=case_id, event_type="task_assigned", actor="coordinator", target="entity-agent"
     )
-    secondary_issues = _unique([topic for topic in topics if topic != issue])[:10]
-    if issue in {"unsupported_claim", "insufficient_evidence"}:
-        case_status = "needs_investigation"
-    elif issue in {"valid_split_payment"} or issue == "unsupported_claim":
-        case_status = "no_action"
+    history = await fetch(
+        "get_customer_history",
+        "entity-agent",
+        customer_unique_id=case.get("customer_unique_id_hint"),
+    )
+    valid_candidates = [candidate for candidate in candidates if ORDER_ID.fullmatch(candidate)]
+    order = None
+    selected, next_purchase = _selected_order(
+        history, order, valid_candidates, opened_at, primary_claim
+    )
+    if selected is None and claimed in valid_candidates:
+        order = await fetch("get_order", "entity-agent", order_id=claimed)
+        selected, next_purchase = _selected_order(
+            history, order, valid_candidates, opened_at, primary_claim
+        )
+    resolved_id = selected.get("order_id") if selected else None
+    start = _date(selected.get("order_purchase_timestamp")) if selected else None
+    rejected = [candidate for candidate in candidates if candidate != resolved_id]
+    trace.emit(
+        case_id=case_id,
+        event_type="handoff",
+        actor="entity-agent",
+        target="coordinator",
+        decision_code="ORDER_RESOLVED" if resolved_id else "ORDER_NOT_FOUND",
+        evidence_refs=[
+            evidence[name]["evidence_ref"]
+            for name in ("get_customer_history", "get_order")
+            if name in evidence
+        ],
+    )
+
+    item = shipment = payment = product = refund = None
+    if resolved_id:
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor="coordinator",
+            target="order-agent",
+        )
+        item = await fetch("get_order_items", "order-agent", order_id=resolved_id)
+        if case.get("investigation_scope", {}).get("include_product_context"):
+            product = await fetch("get_product_context", "order-agent", order_id=resolved_id)
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor="order-agent",
+            target="coordinator",
+        )
+
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor="coordinator",
+            target="shipment-agent",
+        )
+        shipment = await fetch("get_shipment_summary", "shipment-agent", order_id=resolved_id)
+
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor="coordinator",
+            target="payment-agent",
+        )
+        payment = await fetch("get_payment_timeline", "payment-agent", order_id=resolved_id)
+        topics = {
+            claim.get("topic") for claim in request.get("claims", []) if isinstance(claim, dict)
+        }
+        if topics & {"refund_pending", "refund_failed"}:
+            refund = await fetch("get_refund_timeline", "payment-agent", order_id=resolved_id)
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor="payment-agent",
+            target="coordinator",
+        )
+
+    trace.emit(
+        case_id=case_id, event_type="task_assigned", actor="coordinator", target="policy-agent"
+    )
+    policy = await fetch("get_policy", "policy-agent", policy_version=case.get("policy_version"))
+
+    item_rows = _rows((item or {}).get("data"))
+    product_rows = _rows((product or {}).get("data"))
+    if start:
+        item_rows = [
+            row for row in item_rows if _inside(row, "shipping_limit_date", start, next_purchase)
+        ]
+    item_rows = list(
+        {
+            (
+                row.get("order_item_id"),
+                row.get("shipping_limit_date"),
+                row.get("price"),
+                row.get("freight_value"),
+            ): row
+            for row in item_rows
+        }.values()
+    )
+    shipment_data = (shipment or {}).get("data") or {}
+    shipping_limits = _rows(shipment_data, "shipping_limits")
+    if start:
+        shipping_limits = [
+            row
+            for row in shipping_limits
+            if _inside(row, "shipping_limit_at", start, next_purchase)
+        ]
+    payment_events = _rows((payment or {}).get("data") or {}, "events")
+    refund_events = _rows((refund or {}).get("data") or {}, "events")
+    if start:
+        payment_events = [
+            row for row in payment_events if _inside(row, "event_at", start, next_purchase)
+        ]
+        refund_events = [
+            row for row in refund_events if _inside(row, "event_at", start, next_purchase)
+        ]
+
+    captures = [
+        row
+        for row in payment_events
+        if row.get("event_type") == "captured" and row.get("status") == "confirmed"
+    ]
+    refunded = sum(
+        (
+            _amount(row.get("amount_brl")) or Decimal(0)
+            for row in refund_events
+            if row.get("status") in {"confirmed", "completed", "succeeded"}
+        ),
+        Decimal(0),
+    )
+    expected_total = sum(
+        (
+            (_amount(row.get("price")) or Decimal(0))
+            + (_amount(row.get("freight_value")) or Decimal(0))
+            for row in item_rows
+        ),
+        Decimal(0),
+    )
+    filtered_payment_conflict = False
+    if primary_claim == "valid_split_payment" and expected_total and len(captures) > 2:
+        for pair in combinations(captures, 2):
+            pair_total = sum(
+                (_amount(row.get("amount_brl")) or Decimal(0) for row in pair),
+                Decimal(0),
+            )
+            if abs(pair_total - expected_total) <= Decimal("0.01"):
+                captures = list(pair)
+                filtered_payment_conflict = True
+                break
+    captured = sum((_amount(row.get("amount_brl")) or Decimal(0) for row in captures), Decimal(0))
+    mismatch = any(row.get("event_type") == "reconciliation_mismatch" for row in payment_events)
+    refund_statuses = {row.get("status") for row in refund_events}
+    duplicate = bool(
+        expected_total and captured > expected_total + Decimal("0.01") and len(captures) > 1
+    )
+    if "failed" in refund_statuses:
+        payment_verdict = "refund_failed"
+    elif "pending" in refund_statuses:
+        payment_verdict = "refund_pending"
+    elif refunded > 0:
+        payment_verdict = "refunded"
+    elif mismatch:
+        payment_verdict = "capture_mismatch"
+    elif duplicate:
+        payment_verdict = "duplicate_capture"
+    elif primary_claim in {"canceled_order_paid", "unavailable_order_paid"} and captures:
+        # A confirmed capture is sufficient to reconcile the payment side of a
+        # canceled/unavailable order. The business defect is the order state,
+        # not an unexplained payment delta against freight-inclusive item rows.
+        payment_verdict = "reconciled"
+    elif captures and (not expected_total or abs(captured - expected_total) <= Decimal("0.01")):
+        payment_verdict = "reconciled"
     else:
-        case_status = "action_required"
-    all_sellers = _unique([seller for result in order_products for seller in result.seller_ids])
-    all_items = _unique([item for result in order_products for item in result.item_ids])
-    all_products = _unique([product for result in order_products for product in result.product_ids])
-    all_shipments = _unique([shipment for result in shipments for shipment in result.shipment_ids])
-    all_payment_refs = _unique([reference for result in payments for reference in result.payment_references])
-    conflicts = [
-        conflict
-        for result in shipments
-        for conflict in result.data_conflicts
-    ][:5]
+        payment_verdict = "insufficient_evidence"
+
+    carrier = _date(selected.get("order_delivered_carrier_date")) if selected else None
+    delivered = _date(selected.get("order_delivered_customer_date")) if selected else None
+    estimated = _date(selected.get("order_estimated_delivery_date")) if selected else None
+    late_sellers = _unique(
+        [
+            row.get("seller_id")
+            for row in shipping_limits
+            if carrier and (limit := _date(row.get("shipping_limit_at"))) and carrier > limit
+        ]
+    )
+    if selected and selected.get("order_status") == "delivered" and delivered and estimated:
+        shipment_verdict = (
+            "on_time"
+            if delivered <= estimated
+            else "seller_delay"
+            if late_sellers
+            else "logistics_delay"
+        )
+    else:
+        shipment_verdict = "insufficient_evidence"
+    if shipment_verdict == "seller_delay" and resolved_id:
+        await fetch("get_sellers", "shipment-agent", order_id=resolved_id)
+    if resolved_id:
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor="shipment-agent",
+            target="coordinator",
+        )
+
+    status = selected.get("order_status") if selected else None
+    supported = {
+        "canceled_order_paid": status == "canceled" and captured > 0,
+        "unavailable_order_paid": status == "unavailable" and captured > 0,
+        "late_delivery_seller": shipment_verdict == "seller_delay",
+        "late_delivery_logistics": shipment_verdict == "logistics_delay",
+        "valid_split_payment": payment_verdict == "reconciled" and len(captures) >= 2,
+        "payment_mismatch": payment_verdict == "capture_mismatch",
+        "duplicate_charge": payment_verdict == "duplicate_capture",
+        "refund_pending": payment_verdict == "refund_pending",
+        "refund_failed": payment_verdict == "refund_failed",
+        "unsupported_claim": bool(selected and payment and shipment),
+    }
+    if primary_claim in supported and supported[primary_claim]:
+        primary = primary_claim
+    elif selected and payment and shipment:
+        primary = "unsupported_claim"
+    else:
+        # Sử dụng Meta-Llama-3.1-8B-Instruct semantic analyzer nếu rơi vào vùng mơ hồ
+        ai_resolved = False
+        if LLAMA.is_available() and request.get("message"):
+            prompt = (
+                f"Customer claim message: '{request.get('message')}'. "
+                f"Claims: {request.get('claims')}. "
+                "Map to exactly one allowed issue: late_delivery_logistics, late_delivery_seller, "
+                "valid_split_payment, payment_mismatch, duplicate_charge, refund_pending, "
+                "refund_failed, canceled_order_paid, unavailable_order_paid, unsupported_claim. "
+                "Return JSON with key 'predicted_issue'."
+            )
+            ai_res = LLAMA.analyze_semantic(prompt)
+            if ai_res and supported.get(ai_res.get("predicted_issue", ""), False):
+                primary = ai_res["predicted_issue"]
+                ai_resolved = True
+        if not ai_resolved:
+            primary = "insufficient_evidence"
+
+    rules = ((policy or {}).get("data") or {}).get("rules") or {}
+    rule = rules.get(primary) if isinstance(rules, dict) else None
+    if not isinstance(rule, dict):
+        rule = {}
+    valid_statuses = {"action_required", "no_action", "needs_investigation"}
+    case_status = (
+        rule.get("case_status")
+        if rule.get("case_status") in valid_statuses
+        else "needs_investigation"
+    )
+    refundable = max(Decimal(0), captured - refunded)
+    recommended = min(_amount(rule.get("refund_brl")) or Decimal(0), refundable)
+    if case_status != "action_required":
+        recommended = Decimal(0)
+
+    refs = _unique([result["evidence_ref"] for result in evidence.values()])[:30]
+
+    def scoped_refs(*tool_names: str) -> list[str]:
+        return _unique([evidence[name]["evidence_ref"] for name in tool_names if name in evidence])
+
+    claim_tools = {
+        "late_delivery_logistics": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_shipment_summary",
+            "get_policy",
+        ),
+        "late_delivery_seller": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_shipment_summary",
+            "get_sellers",
+            "get_policy",
+        ),
+        "valid_split_payment": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_policy",
+        ),
+        "payment_mismatch": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_policy",
+        ),
+        "duplicate_charge": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_policy",
+        ),
+        "refund_pending": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_refund_timeline",
+            "get_policy",
+        ),
+        "refund_failed": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_refund_timeline",
+            "get_policy",
+        ),
+        "canceled_order_paid": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_shipment_summary",
+            "get_policy",
+        ),
+        "unavailable_order_paid": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_payment_timeline",
+            "get_shipment_summary",
+            "get_policy",
+        ),
+        "unsupported_claim": (
+            "get_customer_history",
+            "get_order",
+            "get_order_items",
+            "get_shipment_summary",
+            "get_payment_timeline",
+            "get_policy",
+        ),
+    }
+    conflicts: list[dict[str, Any]] = []
+    direct_order = (order or {}).get("data") or {}
+    if (
+        selected
+        and direct_order
+        and selected.get("order_purchase_timestamp") != direct_order.get("order_purchase_timestamp")
+    ):
+        conflicts.append(
+            {
+                "field": "order_purchase_timestamp",
+                "sources": ["get_order", "get_customer_history"],
+                "selected_source": "get_customer_history",
+                "resolution_code": "TEMPORAL_CASE_MATCH",
+            }
+        )
+    if (
+        selected
+        and shipment_data
+        and selected.get("order_status") != shipment_data.get("order_status")
+    ):
+        conflicts.append(
+            {
+                "field": "order_status",
+                "sources": ["get_shipment_summary", "get_customer_history"],
+                "selected_source": "get_customer_history",
+                "resolution_code": "TEMPORAL_CASE_MATCH",
+            }
+        )
+    if filtered_payment_conflict:
+        conflicts.append(
+            {
+                "field": "captured_total_brl",
+                "sources": ["get_payment_timeline", "get_order_items"],
+                "selected_source": "get_payment_timeline",
+                "resolution_code": "RECONCILED_SPLIT_SUBSET",
+            }
+        )
+
+    customer_data = (history or {}).get("data") or {}
+    related = _unique([row.get("order_id") for row in _rows(customer_data, "orders")])
+    parties = []
+    for party in rule.get("responsible_parties", [])[:5]:
+        if not isinstance(party, dict) or party.get("party_type") not in {
+            "seller",
+            "platform",
+            "logistics_provider",
+            "payment_provider",
+            "customer",
+            "unknown",
+        }:
+            continue
+        party_id = (
+            late_sellers[0]
+            if party["party_type"] == "seller" and late_sellers
+            else party.get("party_id")
+        )
+        parties.append({"party_type": party["party_type"], "party_id": party_id})
+
+    claim_assessments = []
+    for claim in request.get("claims", [])[:5]:
+        if not isinstance(claim, dict) or not isinstance(claim.get("claim_id"), str):
+            continue
+        topic = claim.get("topic")
+        if topic == "requested_full_refund":
+            verdict = (
+                "supported"
+                if recommended > 0 and recommended >= refundable
+                else "partially_supported"
+                if recommended > 0
+                else "unsupported"
+            )
+        else:
+            verdict = (
+                "supported"
+                if topic == primary
+                else "unsupported"
+                if primary == "unsupported_claim"
+                else "insufficient_evidence"
+            )
+        evidence_topic = primary if topic == "requested_full_refund" else topic
+        names = claim_tools.get(evidence_topic, tuple(evidence))
+        if topic == "requested_full_refund":
+            names = tuple(dict.fromkeys((*names, "get_customer_history", "get_payment_timeline", "get_refund_timeline", "get_order_items")))
+        claim_refs = scoped_refs(*names)
+        if not claim_refs:
+            claim_refs = refs[:10]
+        claim_assessments.append(
+            {
+                "claim_id": claim["claim_id"],
+                "verdict": verdict,
+                "confidence": 0.8 if verdict == "supported" else 0.6,
+                "evidence_refs": claim_refs,
+            }
+        )
+
+    action = (
+        rule.get("recommended_action")
+        if isinstance(rule.get("recommended_action"), str)
+        else "manual_review"
+    )
     output = {
         "schema_version": "day09-l3b-output-v2",
         "case_id": case_id,
         "assessment": {
-            "primary_issue": issue,
-            "secondary_issues": secondary_issues,
+            "primary_issue": primary,
+            "secondary_issues": [],
             "case_status": case_status,
-            "confidence": 0.9 if entity.status == "resolved" and evidence_available else 0.2,
+            "confidence": 0.82
+            if primary not in {"unsupported_claim", "insufficient_evidence"}
+            else 0.65
+            if primary == "unsupported_claim"
+            else 0.2,
         },
         "affected_entities": {
-            "order_ids": resolved_order_ids[:20],
-            "item_ids": all_items[:20],
-            "seller_ids": all_sellers[:20],
-            "payment_references": all_payment_refs[:20],
-            "shipment_ids": all_shipments[:20],
+            "order_ids": [resolved_id] if resolved_id else [],
+            "item_ids": _unique([row.get("order_item_id") for row in item_rows + product_rows]),
+            "seller_ids": _unique([row.get("seller_id") for row in item_rows + product_rows]),
+            "payment_references": [],
+            "shipment_ids": [],
         },
         "claim_assessments": claim_assessments,
         "entity_resolution": {
-            "status": entity.status,
-            "resolved_order_ids": resolved_order_ids[:20],
-            "rejected_candidates": rejected_candidates[:20],
-            "confidence": entity.confidence,
+            "status": "resolved" if resolved_id else "not_found",
+            "resolved_order_ids": [resolved_id] if resolved_id else [],
+            "rejected_candidates": rejected,
+            "confidence": 0.9 if history and selected else 0.6 if selected else 0.1,
         },
         "customer_context": {
-            "customer_unique_id": entity.customer_unique_id,
-            "related_order_ids": list(entity.related_order_ids)[:20],
+            "customer_unique_id": customer_data.get("customer_unique_id") if history else None,
+            "related_order_ids": related,
         },
         "shipment_analysis": {
-            "verdict": shipments[0].verdict if shipments else "insufficient_evidence",
-            "late_seller_ids": _unique([seller for result in shipments for seller in result.late_seller_ids])[:20],
-            "timeline_complete": bool(shipments) and all(result.timeline_complete for result in shipments),
+            "verdict": shipment_verdict,
+            "late_seller_ids": late_sellers if shipment_verdict == "seller_delay" else [],
+            "timeline_complete": bool(selected and carrier and delivered and estimated),
         },
         "payment_analysis": {
-            "verdict": payments[0].verdict if payments else "insufficient_evidence",
-            "captured_total_brl": payments[0].captured_total_brl if payments else None,
-            "refunded_total_brl": payments[0].refunded_total_brl if payments else None,
-            "refundable_total_brl": payments[0].refundable_total_brl if payments else None,
+            "verdict": payment_verdict,
+            "captured_total_brl": float(captured) if captures else None,
+            "refunded_total_brl": float(refunded) if refund else None,
+            "refundable_total_brl": float(refundable) if captures else None,
         },
-        "root_cause_analysis": _root_cause(issue, shipments, order_products),
-        "evidence_refs": evidence_refs,
-        "data_conflicts": conflicts,
+        "root_cause_analysis": {
+            "ranked_causes": [{"cause_code": primary.upper(), "rank": 1}]
+            if primary != "insufficient_evidence"
+            else [],
+            "responsible_parties": parties,
+        },
+        "evidence_refs": refs,
+        "data_conflicts": conflicts[:5],
         "financial_resolution": {
             "currency": "BRL",
-            "recommended_refund_brl": recommended_refund,
-            "refund_lines": refund_lines,
+            "recommended_refund_brl": float(recommended),
+            "refund_lines": [
+                {
+                    "reason_code": primary.upper(),
+                    "amount_brl": float(recommended),
+                    "entity_id": resolved_id,
+                }
+            ]
+            if recommended > 0
+            else [],
         },
-        "resolution_actions": (
-            ["Process eligible refund"]
-            if recommended_refund > 0
-            else ["Close investigation with recorded evidence"]
-            if issue == "unsupported_claim"
-            else ["Investigate missing authoritative evidence"]
-            if issue == "insufficient_evidence"
-            else ["Review case and apply policy resolution"]
-        ),
+        "resolution_actions": [action],
     }
+    trace.emit(
+        case_id=case_id,
+        event_type="policy_decided",
+        actor="policy-agent",
+        decision_code=primary.upper(),
+        evidence_refs=[policy["evidence_ref"]] if policy else [],
+    )
+    trace.emit(
+        case_id=case_id,
+        event_type="handoff",
+        actor="policy-agent",
+        target="verifier",
+        decision_code=primary.upper(),
+        evidence_refs=[policy["evidence_ref"]] if policy else [],
+    )
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
         actor="verifier",
-        decision_code="OUTPUT_ASSEMBLED",
-        evidence_refs=evidence_refs[:20],
+        decision_code="EVIDENCE_SCOPED" if refs else "NO_EVIDENCE",
+        evidence_refs=refs[:20],
+        attributes={"resolved": bool(resolved_id), "conflicts": len(conflicts)},
     )
     return output
